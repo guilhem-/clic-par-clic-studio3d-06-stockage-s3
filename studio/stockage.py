@@ -56,7 +56,7 @@ def preparer_depot(d: dict) -> dict:
 def nom_fichier(d: dict) -> str:
     """Nom proposé au téléchargement : le titre en ASCII, puis le numéro (salon-1.blend)."""
     titre = unicodedata.normalize("NFKD", d.get("titre", "scene")).encode("ascii", "ignore").decode()
-    titre = re.sub(r"[^a-z0-9]+", "-", titre.lower()).strip("-")[:40] or "scene"
+    titre = re.sub(r"[^a-z0-9]+", "-", titre.lower()).strip("-")[:40].rstrip("-") or "scene"
     return f"{titre}-{d.get('numero', '')}.blend"
 
 
