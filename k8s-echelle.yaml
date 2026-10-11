@@ -1,0 +1,242 @@
+# Studio 3D à l'échelle (module s3d02) : file Redis partagée, serveur MCP en deux copies, workers
+# Blender de 0 à 4, nombre piloté par KEDA selon la file. Remplace le studio simple (k8s.yaml) :
+# même service « studio », même entrée Traefik — pour Open WebUI, rien ne change.
+# Module s3d03 : image studio3d:3 et annotations prometheus.io/* (mesures lues par services/observabilite).
+# Module s3d04 : politique de marquage visible des rendus (MARQUAGE_VISIBLE_*, sur studio-api).
+# Module s3d05 : image studio3d:4 et bibliothèque d'assets (image studio3d-assets:<version>, montée en
+#   lecture seule sur /assets par le volume « image » de Kubernetes, dans le serveur et les workers).
+# Module s3d06 : image studio3d:5 ; scène Blender déposée dans le stockage S3 de l'équipe stockage. Les clés
+#   (secret « stockage », facultatif : sans lui, rien ne change) vont au seul serveur MCP ; les workers
+#   reçoivent des identifiants temporaires par Redis. Règle de sortie : k8s-stockage.yaml.
+#   kubectl apply -f k8s-echelle.yaml   (après le secret « studio » : clés jeton et redis)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: studio3d
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command: ["sh", "-c", "exec redis-server --requirepass \"$MOT_DE_PASSE\" --save '' --appendonly no"]
+          env:
+            - name: MOT_DE_PASSE
+              valueFrom: { secretKeyRef: { name: studio, key: redis } }
+          ports: [{ containerPort: 6379 }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: studio3d
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-api
+  namespace: studio3d
+spec:
+  replicas: 2                        # serveur MCP sans session : n'importe quelle copie répond
+  selector:
+    matchLabels: { app: studio-api }
+  template:
+    metadata:
+      labels: { app: studio-api, role: studio }
+      annotations:                   # Prometheus lit ce pod, sur ce port (/metrics)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      volumes:
+        - name: assets                     # la bibliothèque : une image, montée comme un dossier
+          image:
+            reference: studio3d-assets:1   # la version de la bibliothèque (en production : @sha256:…)
+            pullPolicy: IfNotPresent       # déjà dans le cache du nœud : rien à télécharger
+      containers:
+        - name: api
+          image: studio3d:5
+          imagePullPolicy: IfNotPresent
+          command: ["python", "api.py"]
+          ports: [{ containerPort: 8000 }]
+          env:
+            - name: STUDIO_JETON
+              valueFrom: { secretKeyRef: { name: studio, key: jeton } }
+            - name: REDIS_MOT_DE_PASSE
+              valueFrom: { secretKeyRef: { name: studio, key: redis } }
+            - name: REDIS_HOTE
+              value: redis
+            - name: STUDIO_PUBLIC_URL
+              value: http://studio.localhost:8080
+            # Politique de l'organisation pour le bandeau visible (le marquage invisible est toujours fait) :
+            - name: MARQUAGE_VISIBLE_DEFAUT    # « oui » : bandeau quand l'utilisateur ne précise rien
+              value: "non"
+            - name: MARQUAGE_VISIBLE_IMPOSE    # « oui » : bandeau toujours, quoi que demande l'utilisateur
+              value: "non"
+            # Stockage des scènes (module s3d06) : les clés longue durée, ici seulement.
+            - name: S3_INTERNE                 # pour demander des identifiants temporaires
+              value: http://s3.stockage.svc.cluster.local:9000
+            - name: S3_PUBLIC                  # pour signer les liens : l'adresse vue du navigateur
+              value: http://s3.localhost:8080
+            - name: S3_DEPOT_CLE
+              valueFrom: { secretKeyRef: { name: stockage, key: depot-cle, optional: true } }
+            - name: S3_DEPOT_SECRET
+              valueFrom: { secretKeyRef: { name: stockage, key: depot-secret, optional: true } }
+            - name: S3_LIENS_CLE
+              valueFrom: { secretKeyRef: { name: stockage, key: liens-cle, optional: true } }
+            - name: S3_LIENS_SECRET
+              valueFrom: { secretKeyRef: { name: stockage, key: liens-secret, optional: true } }
+          volumeMounts:
+            - { name: assets, mountPath: /assets, readOnly: true }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /sante, port: 8000 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: studio                       # même nom qu'au module s3d01 : l'adresse vue par Open WebUI ne change pas
+  namespace: studio3d
+spec:
+  selector: { app: studio-api }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-travailleur
+  namespace: studio3d
+spec:
+  replicas: 0                        # piloté par KEDA (ScaledObject ci-dessous)
+  selector:
+    matchLabels: { app: studio-travailleur }
+  template:
+    metadata:
+      labels: { app: studio-travailleur, role: studio }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+    spec:
+      terminationGracePeriodSeconds: 120   # à l'arrêt, le worker termine son rendu en cours
+      volumes:
+        - name: assets                     # même bibliothèque que le serveur MCP
+          image:
+            reference: studio3d-assets:1
+            pullPolicy: IfNotPresent
+      containers:
+        - name: blender
+          image: studio3d:5
+          imagePullPolicy: IfNotPresent
+          command: ["python", "travailleur.py"]
+          ports: [{ name: metriques, containerPort: 9101 }]
+          env:
+            - name: STUDIO_JETON
+              valueFrom: { secretKeyRef: { name: studio, key: jeton } }
+            - name: REDIS_MOT_DE_PASSE
+              valueFrom: { secretKeyRef: { name: studio, key: redis } }
+            - name: REDIS_HOTE
+              value: redis
+            - name: STUDIO_PUBLIC_URL
+              value: http://studio.localhost:8080
+            - name: ASSETS                 # lu par Blender (rendu.py), en lecture seule
+              value: /assets
+            - name: S3_INTERNE             # module s3d06 : dépôt de la scène, aucune clé ici
+              value: http://s3.stockage.svc.cluster.local:9000
+          volumeMounts:
+            - { name: assets, mountPath: /assets, readOnly: true }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "4", memory: 4Gi }
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: redis
+  namespace: studio3d
+spec:
+  secretTargetRef:
+    - { parameter: password, name: studio, key: redis }
+---
+# Un worker par demande en attente ou en cours (jusqu'à 4) ; zéro worker quand tout est fini.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: studio-travailleur
+  namespace: studio3d
+spec:
+  scaleTargetRef: { name: studio-travailleur }
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  pollingInterval: 5
+  cooldownPeriod: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown: { stabilizationWindowSeconds: 20 }
+  triggers:                          # une seule mesure : demandes en attente + en cours (plusieurs déclencheurs prendraient le maximum, pas la somme)
+    - type: redis
+      authenticationRef: { name: redis }
+      metadata: { address: redis.studio3d.svc.cluster.local:6379, listName: "studio:charge", listLength: "1" }
+---
+# Seuls les rendus (liens signés) et les vignettes de la bibliothèque sont publiés hors du cluster ; /mcp reste interne.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: studio
+  namespace: studio3d
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: studio.localhost
+      http:
+        paths:
+          - path: /r/
+            pathType: Prefix
+            backend: { service: { name: studio, port: { number: 8000 } } }
+          - path: /a/                      # vignettes des assets : libres de droits, sans signature
+            pathType: Prefix
+            backend: { service: { name: studio, port: { number: 8000 } } }
+---
+# Serveur et workers : aucune sortie, sauf vers Redis (et la résolution de noms pour le trouver).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: studio-vers-redis-seulement
+  namespace: studio3d
+spec:
+  podSelector: { matchLabels: { role: studio } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app: redis } } }]
+      ports: [{ port: 6379, protocol: TCP }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+---
+# Redis : joignable par le studio et par KEDA (qui lit la longueur de la file), personne d'autre.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-studio-et-keda
+  namespace: studio3d
+spec:
+  podSelector: { matchLabels: { app: redis } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { role: studio } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: keda } }
+      ports: [{ port: 6379, protocol: TCP }]

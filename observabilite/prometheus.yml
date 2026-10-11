@@ -1,0 +1,35 @@
+# Prometheus (module s3d03) : une seule tâche, les pods du studio 3D qui portent l'annotation.
+global:
+  scrape_interval: 5s          # lecture des mesures toutes les cinq secondes
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: studio3d
+    # Les workers vont et viennent (KEDA, de zéro à quatre) : Prometheus demande la liste des pods
+    # à l'API Kubernetes et la tient à jour, au lieu d'adresses écrites à l'avance.
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces: { names: [studio3d] }
+    relabel_configs:
+      # Garder les pods annotés prometheus.io/scrape: "true", et seulement ceux qui tournent.
+      - { source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape], regex: "true", action: keep }
+      - { source_labels: [__meta_kubernetes_pod_phase], regex: Running, action: keep }
+      # Lire le port donné par l'annotation prometheus.io/port.
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: __address__
+      # Étiquettes lisibles : application (studio-api ou studio-travailleur) et nom du pod.
+      - { source_labels: [__meta_kubernetes_pod_label_app], target_label: app }
+      - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+
+  # Module s3d06 : le stockage S3 de l'équipe stockage (RustFS). RustFS pousse ses mesures en OTLP vers
+  # son collecteur OpenTelemetry, qui les publie au format Prometheus ; on n'en garde que quelques-unes.
+  - job_name: stockage
+    scrape_interval: 15s
+    static_configs:
+      - targets: [otel-collecteur.stockage.svc.cluster.local:8889]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: rustfs_(s3_http_requests_total|http_server_failures_total|cluster_usage_buckets_(objects_count|total_bytes))
+        action: keep

@@ -1,0 +1,172 @@
+# Stockage objet de l'organisation (équipe stockage, module s3d06) : un service compatible S3, dans
+# son propre espace de noms. Produit retenu : RustFS 1.0.1 (Apache 2.0), image épinglée par empreinte.
+# Le service s'appelle « s3 », pas « rustfs » : le nom du rôle survit au changement de produit.
+#   kubectl apply -f k8s.yaml   (après les secrets s3-racine et comptes : voir deployer.mjs)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stockage
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: s3-donnees
+  namespace: stockage
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: { storage: 5Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3
+  namespace: stockage
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # un seul pod écrit sur le volume
+  selector:
+    matchLabels: { app: s3 }
+  template:
+    metadata:
+      labels: { app: s3 }
+    spec:
+      securityContext: { fsGroup: 10001 }  # utilisateur « rustfs » de l'image
+      volumes:
+        - name: donnees
+          persistentVolumeClaim: { claimName: s3-donnees }
+      containers:
+        - name: rustfs
+          # rustfs/rustfs:1.0.1, épinglée par son empreinte (index multi-architecture)
+          image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: s3, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          env:
+            - { name: RUSTFS_VOLUMES, value: /data }
+            - { name: RUSTFS_ADDRESS, value: ":9000" }
+            - { name: RUSTFS_CONSOLE_ENABLE, value: "true" }
+            - { name: RUSTFS_CONSOLE_ADDRESS, value: ":9001" }
+            - { name: RUSTFS_REGION, value: us-east-1 }
+            - name: RUSTFS_ACCESS_KEY       # la clé racine : elle reste dans cet espace de noms
+              valueFrom: { secretKeyRef: { name: s3-racine, key: cle } }
+            - name: RUSTFS_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: s3-racine, key: secret } }
+            # Mesures : poussées en OTLP vers le collecteur, qui les publie pour Prometheus.
+            - { name: RUSTFS_OBS_ENDPOINT, value: "http://otel-collecteur.stockage.svc.cluster.local:4318" }
+            - { name: RUSTFS_OBS_METER_INTERVAL, value: "15" }
+            - { name: RUSTFS_OBS_TRACES_EXPORT_ENABLED, value: "false" }
+            - { name: RUSTFS_OBS_LOGS_EXPORT_ENABLED, value: "false" }
+          volumeMounts:
+            - { name: donnees, mountPath: /data }
+          readinessProbe:
+            httpGet: { path: /health, port: 9000 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3                            # le nom du rôle, pas du produit
+  namespace: stockage
+spec:
+  selector: { app: s3 }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# Entrées : l'espace du studio (port S3), Traefik (publication), la préparation. Personne d'autre.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s3-entrees
+  namespace: stockage
+spec:
+  podSelector: { matchLabels: { app: s3 } }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: studio3d } } }]
+      ports: [{ port: 9000, protocol: TCP }]
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
+      ports: [{ port: 9000, protocol: TCP }, { port: 9001, protocol: TCP }]
+    - from: [{ podSelector: { matchLabels: { app: preparation } } }]
+      ports: [{ port: 9000, protocol: TCP }]
+---
+# Publication : télécharger avec un lien signé, rien d'autre (ni écriture, ni administration).
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: s3-public
+  namespace: stockage
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`s3.localhost`) && (Method(`GET`) || Method(`HEAD`))
+      kind: Rule
+      services: [{ name: s3, port: 9000 }]
+---
+# Console de RustFS : publiée pour le tournage (en production, elle resterait interne).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: console
+  namespace: stockage
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: stockage.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: s3, port: { number: 9001 } } }
+---
+# Collecteur OpenTelemetry : reçoit les mesures de RustFS (OTLP) et les publie au format Prometheus
+# (port 8889), lu par le Prometheus de services/observabilite. RustFS n'a pas de page /metrics.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collecteur
+  namespace: stockage
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: otel-collecteur }
+  template:
+    metadata:
+      labels: { app: otel-collecteur }
+    spec:
+      volumes:
+        - name: configuration
+          configMap: { name: otel-collecteur }
+      containers:
+        - name: collecteur
+          # otel/opentelemetry-collector:0.162.0 (distribution de base), épinglée par empreinte
+          image: otel/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/etc/otelcol/collecteur.yaml"]
+          ports:
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: prometheus, containerPort: 8889 }
+          volumeMounts:
+            - { name: configuration, mountPath: /etc/otelcol }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collecteur
+  namespace: stockage
+spec:
+  selector: { app: otel-collecteur }
+  ports:
+    - { name: otlp-http, port: 4318, targetPort: 4318 }
+    - { name: prometheus, port: 8889, targetPort: 8889 }
