@@ -1,6 +1,6 @@
 {
   "uid": "studio3d",
-  "title": "Studio 3D",
+  "title": "3D studio",
   "tags": [
     "studio3d",
     "clic-par-clic"
@@ -36,7 +36,7 @@
     {
       "id": 1,
       "type": "stat",
-      "title": "Demandes en attente",
+      "title": "Waiting requests",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -54,7 +54,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(studio_file_attente)",
+          "expr": "max(studio_queue_waiting)",
           "instant": true,
           "range": false
         }
@@ -103,7 +103,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Rendus en cours",
+      "title": "Renders in progress",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(studio_rendus_en_cours)",
+          "expr": "max(studio_renders_running)",
           "instant": true,
           "range": false
         }
@@ -166,7 +166,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Workers actifs",
+      "title": "Active workers",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -184,7 +184,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count(up{job=\"studio3d\", app=\"studio-travailleur\"} == 1) or vector(0)",
+          "expr": "count(up{job=\"studio3d\", app=\"studio-worker\"} == 1) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -229,7 +229,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Utilisateurs distincts (heure)",
+      "title": "Distinct users (hour)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -247,7 +247,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(studio_utilisateurs_heure)",
+          "expr": "max(studio_users_hour)",
           "instant": true,
           "range": false
         }
@@ -292,7 +292,7 @@
     {
       "id": 9,
       "type": "stat",
-      "title": "Échecs (15 min)",
+      "title": "Failures (15 min)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -310,7 +310,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(studio_rendus_total{resultat!=\"termine\"}[15m])) or vector(0)",
+          "expr": "sum(increase(studio_renders_total{result!=\"done\"}[15m])) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -359,7 +359,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "File d'attente et workers",
+      "title": "Queue and workers",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -377,8 +377,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(studio_file_attente)",
-          "legendFormat": "Demandes en attente",
+          "expr": "max(studio_queue_waiting)",
+          "legendFormat": "Waiting requests",
           "range": true
         },
         {
@@ -387,8 +387,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count(up{job=\"studio3d\", app=\"studio-travailleur\"} == 1) or vector(0)",
-          "legendFormat": "Workers actifs",
+          "expr": "count(up{job=\"studio3d\", app=\"studio-worker\"} == 1) or vector(0)",
+          "legendFormat": "Active workers",
           "range": true
         }
       ],
@@ -442,7 +442,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Demandes en attente"
+              "options": "Waiting requests"
             },
             "properties": [
               {
@@ -457,7 +457,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Workers actifs"
+              "options": "Active workers"
             },
             "properties": [
               {
@@ -475,7 +475,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Demandes par outil MCP (par minute)",
+      "title": "Requests per MCP tool (per minute)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -493,8 +493,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (outil) (rate(studio_demandes_total[1m])) * 60",
-          "legendFormat": "{{outil}}",
+          "expr": "sum by (tool) (rate(studio_requests_total[1m])) * 60",
+          "legendFormat": "{{tool}}",
           "range": true
         }
       ],
@@ -592,7 +592,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Durée des rendus",
+      "title": "Render duration",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -610,8 +610,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(studio_rendu_duree_secondes_bucket[5m])))",
-          "legendFormat": "médiane",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(studio_render_duration_seconds_bucket[5m])))",
+          "legendFormat": "median",
           "range": true
         },
         {
@@ -620,8 +620,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(studio_rendu_duree_secondes_bucket[5m])))",
-          "legendFormat": "95e centile",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(studio_render_duration_seconds_bucket[5m])))",
+          "legendFormat": "95th percentile",
           "range": true
         }
       ],
@@ -670,7 +670,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "médiane"
+              "options": "median"
             },
             "properties": [
               {
@@ -685,7 +685,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "95e centile"
+              "options": "95th percentile"
             },
             "properties": [
               {
@@ -703,7 +703,7 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Attente avant rendu",
+      "title": "Wait before render",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -721,8 +721,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(studio_attente_secondes_bucket[5m])))",
-          "legendFormat": "95e centile",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(studio_wait_seconds_bucket[5m])))",
+          "legendFormat": "95th percentile",
           "range": true
         }
       ],
@@ -771,7 +771,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "95e centile"
+              "options": "95th percentile"
             },
             "properties": [
               {
@@ -789,7 +789,7 @@
     {
       "id": 10,
       "type": "alertlist",
-      "title": "Alertes",
+      "title": "Alerts",
       "gridPos": {
         "x": 16,
         "y": 13,
@@ -821,7 +821,7 @@
     {
       "id": 20,
       "type": "row",
-      "title": "Stockage des scènes (RustFS, équipe stockage)",
+      "title": "Scene storage (RustFS, storage team)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -834,7 +834,7 @@
     {
       "id": 21,
       "type": "stat",
-      "title": "Scènes déposées (heure)",
+      "title": "Scenes stored (hour)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -852,7 +852,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(studio_scenes_total{resultat=\"deposee\"}[1h])) or vector(0)",
+          "expr": "sum(increase(studio_scenes_total{result=\"uploaded\"}[1h])) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -897,7 +897,7 @@
     {
       "id": 22,
       "type": "stat",
-      "title": "Mo déposés (heure)",
+      "title": "MB stored (hour)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -915,7 +915,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(studio_scenes_octets_total[1h])) / 1e6 or vector(0)",
+          "expr": "sum(increase(studio_scene_bytes_total[1h])) / 1e6 or vector(0)",
           "instant": true,
           "range": false
         }
@@ -960,7 +960,7 @@
     {
       "id": 23,
       "type": "stat",
-      "title": "Identifiants temporaires (heure)",
+      "title": "Temporary credentials (hour)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -978,7 +978,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(studio_identifiants_temporaires_total[1h])) or vector(0)",
+          "expr": "sum(increase(studio_temporary_credentials_total[1h])) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -1023,7 +1023,7 @@
     {
       "id": 24,
       "type": "stat",
-      "title": "Refus du stockage (15 min)",
+      "title": "Storage denials (15 min)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1090,7 +1090,7 @@
     {
       "id": 25,
       "type": "timeseries",
-      "title": "Stockage : requêtes S3 (par minute)",
+      "title": "Storage: S3 requests (per minute)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1149,7 +1149,7 @@
     {
       "id": 26,
       "type": "timeseries",
-      "title": "Studio : scènes et liens (par minute)",
+      "title": "Studio: scenes and links (per minute)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1167,8 +1167,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(studio_scenes_total{resultat=\"deposee\"}[2m])) * 60",
-          "legendFormat": "scène déposée",
+          "expr": "sum(rate(studio_scenes_total{result=\"uploaded\"}[2m])) * 60",
+          "legendFormat": "scene stored",
           "range": true
         },
         {
@@ -1177,8 +1177,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(studio_scenes_total{resultat!=\"deposee\"}[2m])) * 60",
-          "legendFormat": "scène indisponible",
+          "expr": "sum(rate(studio_scenes_total{result!=\"uploaded\"}[2m])) * 60",
+          "legendFormat": "scene unavailable",
           "range": true
         },
         {
@@ -1187,8 +1187,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(studio_liens_scene_total{resultat=\"redirige\"}[2m])) * 60",
-          "legendFormat": "lien suivi",
+          "expr": "sum(rate(studio_scene_links_total{result=\"redirected\"}[2m])) * 60",
+          "legendFormat": "link followed",
           "range": true
         },
         {
@@ -1197,8 +1197,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(studio_liens_scene_total{resultat=\"expiree\"}[2m])) * 60",
-          "legendFormat": "lien expiré",
+          "expr": "sum(rate(studio_scene_links_total{result=\"expired\"}[2m])) * 60",
+          "legendFormat": "link expired",
           "range": true
         }
       ],
@@ -1236,7 +1236,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "scène déposée"
+              "options": "scene stored"
             },
             "properties": [
               {
@@ -1251,7 +1251,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "scène indisponible"
+              "options": "scene unavailable"
             },
             "properties": [
               {
@@ -1266,7 +1266,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "lien suivi"
+              "options": "link followed"
             },
             "properties": [
               {
@@ -1281,7 +1281,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "lien expiré"
+              "options": "link expired"
             },
             "properties": [
               {

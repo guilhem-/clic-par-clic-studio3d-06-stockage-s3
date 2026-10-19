@@ -1,18 +1,18 @@
-"""Studio 3D à l'échelle — serveur MCP sans session, en plusieurs copies derrière le service « studio ».
+"""3D studio at scale: stateless MCP server, several copies behind the "studio" service.
 
-Mêmes outils qu'au module s3d01 (soumettre_rendu, etat_rendu, mes_rendus) : pour Open WebUI, rien ne
-change. Aucune copie ne garde d'état en mémoire : les demandes vont dans Redis, et les workers
-(travailleur.py) viennent les y chercher. Chaque copie surveille aussi les demandes dont le worker a
-disparu, et les remet dans la file.
+Same tools as in module s3d01 (submit_render, render_status, my_renders): for Open WebUI, nothing
+changes. No copy keeps any state in memory: requests go to Redis, and the workers (worker.py)
+fetch them there. Each copy also watches for requests whose worker disappeared, and puts them
+back in the queue.
 
-Module s3d03 : chaque outil compte ses appels, et les mesures sont publiées sur /metrics (metriques.py).
-Module s3d04 : chaque demande reçoit un identifiant unique et un choix de marquage visible (paramètre
-marquage_visible, politique de l'organisation) ; le worker marque le rendu (marquage.py).
-Module s3d05 : bibliothèque d'assets (objets 3D, éclairages HDRI) montée en lecture seule ; l'outil
-lister_assets la fait découvrir au modèle, la route /a/ publie les vignettes.
-Module s3d06 : la scène Blender de chaque rendu est déposée dans le stockage S3 d'une autre équipe.
-Le serveur garde les clés longue durée : il prépare les identifiants temporaires de dépôt quand un
-worker prend la demande, et répond au lien de la scène par une redirection vers un lien présigné.
+Module s3d03: each tool counts its calls, and the metrics are published on /metrics (metrics.py).
+Module s3d04: each request gets a unique id and a visible-marking choice (visible_marking
+parameter, organization policy); the worker marks the render (marking.py).
+Module s3d05: asset library (3D objects, HDRI lighting) mounted read-only; the list_assets
+tool lets the model discover it, the /a/ route publishes the thumbnails.
+Module s3d06: the Blender scene of each render is uploaded to another team's S3 storage.
+The server keeps the long-term keys: it prepares the temporary upload credentials when a
+worker takes the request, and answers the scene link with a redirect to a presigned link.
 """
 import asyncio
 import hmac
@@ -24,303 +24,303 @@ from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
-import commun as c
-import metriques as m
-import stockage
+import common as c
+import metrics as m
+import storage
 
-r = c.connexion()
-m.REGISTRE.register(m.CollecteurFile(r))  # file, rendus en cours, utilisateurs : lus dans Redis à chaque passage de Prometheus
-# Sans session : chaque appel se suffit à lui-même, n'importe quelle copie peut y répondre.
+r = c.connection()
+m.REGISTRY.register(m.QueueCollector(r))  # queue, renders running, users: read in Redis on every Prometheus scrape
+# Stateless: each call stands on its own, any copy can answer it.
 mcp = FastMCP("studio", host="0.0.0.0", port=8000, stateless_http=True)
 
 
-def _entetes(ctx: Context):
-    requete = ctx.request_context.request
-    return requete.headers if requete is not None else {}
+def _headers(ctx: Context):
+    req = ctx.request_context.request
+    return req.headers if req is not None else {}
 
 
-def _utilisateur(ctx: Context) -> str:
-    """Adresse de l'utilisateur (en-tête rempli par Open WebUI), après contrôle du jeton du studio."""
-    entetes = _entetes(ctx)
-    if entetes.get("authorization", "") != f"Bearer {c.JETON}":
-        raise PermissionError("jeton du studio invalide")
-    email = entetes.get("x-utilisateur-email", "").strip().lower()
+def _user(ctx: Context) -> str:
+    """The user's address (header filled in by Open WebUI), after checking the studio token."""
+    headers = _headers(ctx)
+    if headers.get("authorization", "") != f"Bearer {c.TOKEN}":
+        raise PermissionError("invalid studio token")
+    email = headers.get("x-user-email", "").strip().lower()
     if not email:
-        raise PermissionError("utilisateur inconnu : en-tête X-Utilisateur-Email absent")
-    # Utilisateurs distincts de l'heure : comptés dans Redis, jamais l'adresse en étiquette.
-    heure = m.cle_heure()
-    r.pfadd(heure, email)
-    r.expire(heure, 7200)
+        raise PermissionError("unknown user: X-User-Email header missing")
+    # Distinct users of the hour: counted in Redis, never the address as a label.
+    hour = m.hour_key()
+    r.pfadd(hour, email)
+    r.expire(hour, 7200)
     return email
 
 
-def _position(numero: int) -> int | None:
-    """1 = la prochaine à passer ; None si la demande n'est plus en attente."""
-    en_attente = [int(x) for x in r.lrange(c.FILE, 0, -1)]  # gauche = la plus récente
-    if numero not in en_attente:
+def _position(number: int) -> int | None:
+    """1 = next in line; None if the request is no longer waiting."""
+    waiting = [int(x) for x in r.lrange(c.QUEUE, 0, -1)]  # left = most recent
+    if number not in waiting:
         return None
-    return len(en_attente) - en_attente.index(numero)
+    return len(waiting) - waiting.index(number)
 
 
-# ---------------------------------------------------------------- Outils MCP
+# ---------------------------------------------------------------- MCP tools
 
 @mcp.tool()
-def soumettre_rendu(titre: str, code: str, ctx: Context,
-                    marquage_visible: bool | None = None) -> dict:
-    """Met en file d'attente le rendu d'une scène Blender et répond immédiatement.
+def submit_render(title: str, code: str, ctx: Context,
+                  visible_marking: bool | None = None) -> dict:
+    """Queues the render of a Blender scene and answers immediately.
 
-    code : script Python (bpy) qui construit la scène dans une scène vide : objets, matériaux,
-    lumière, caméra. Ne pas régler le moteur ni enregistrer : le studio s'en charge
-    (Cycles, 1280 x 720, PNG + modèle 3D GLB). Les objets de décor (sol, table, fond) doivent avoir
-    un nom commençant par « Decor » : ils sont rendus mais pas exportés dans le modèle 3D.
-    marquage_visible : true pour un bandeau visible sur l'image (source et date),
-    seulement si l'utilisateur demande une mention visible ; sinon, ne pas le renseigner.
-    Le studio marque toujours le fichier de façon invisible (métadonnées).
-    Le studio a une bibliothèque d'objets réels et d'éclairages HDRI : cherchez avec lister_assets,
-    puis utilisez charger_asset("nom") et environnement("nom") dans le code, jamais un chemin de fichier.
-    Renvoie le numéro de la demande et sa position dans la file."""
-    m.DEMANDES.labels(outil="soumettre_rendu").inc()
-    utilisateur = _utilisateur(ctx)
-    uid = _entetes(ctx).get("x-utilisateur-id", "").strip()  # notifications (série Intégrations)
-    # Bandeau : imposé par l'organisation, sinon le choix de l'utilisateur,
-    # sinon la politique par défaut.
-    choix = marquage_visible if marquage_visible is not None else c.MARQUAGE_DEFAUT
-    visible = c.MARQUAGE_IMPOSE or choix
-    numero = r.incr("studio:compteur")  # atomique : numéro unique, même avec plusieurs copies
-    r.hset(c.demande(numero), mapping={
-        "numero": numero, "titre": titre[:80], "code": code, "utilisateur": utilisateur,
-        "utilisateur_id": uid, "statut": "en_attente", "soumis": time.time(),
-        # Le numéro sert aux humains, l'identifiant à la traçabilité.
-        "identifiant": str(uuid.uuid4()),
-        "marquage_visible": "1" if visible else "0",
-        "scene_prevue": "1" if c.STOCKAGE else "0",  # module s3d06 : la scène Blender sera déposée
+    code: Python script (bpy) that builds the scene in an empty scene: objects, materials,
+    light, camera. Do not set the render engine or save: the studio does it
+    (Cycles, 1280 x 720, PNG + GLB 3D model). Decor objects (floor, table, background) must have
+    a name starting with "Decor": they are rendered but not exported in the 3D model.
+    visible_marking: true for a visible banner on the image (source and date),
+    only if the user asks for a visible notice; otherwise, leave it out.
+    The studio always marks the file invisibly (metadata).
+    The studio has a library of real objects and HDRI lighting: search with list_assets,
+    then use load_asset("name") and environment("name") in the code, never a file path.
+    Returns the request number and its position in the queue."""
+    m.REQUESTS.labels(tool="submit_render").inc()
+    user = _user(ctx)
+    uid = _headers(ctx).get("x-user-id", "").strip()  # notifications (next series)
+    # Banner: enforced by the organization, otherwise the user's choice,
+    # otherwise the default policy.
+    choice = visible_marking if visible_marking is not None else c.MARKING_DEFAULT
+    visible = c.MARKING_ENFORCED or choice
+    number = r.incr("studio:counter")  # atomic: a unique number, even with several copies
+    r.hset(c.request(number), mapping={
+        "number": number, "title": title[:80], "code": code, "user": user,
+        "user_id": uid, "status": "queued", "submitted": time.time(),
+        # The number is for humans, the id for traceability.
+        "id": str(uuid.uuid4()),
+        "visible_marking": "1" if visible else "0",
+        "scene_planned": "1" if c.STORAGE else "0",  # module s3d06: the Blender scene will be uploaded
     })
-    r.lpush(c.FILE, numero)    # la file : les workers la vident par la droite
-    r.lpush(c.CHARGE, numero)  # la charge, lue par KEDA : une entrée par demande en attente ou en cours
-    suite = "L'utilisateur sera prévenu dans Open WebUI." if uid else "Demandez son état avec etat_rendu."
-    return {"numero": numero, "titre": titre, "position": _position(numero), "marquage_visible": visible,
-            "message": f"Demande enregistrée. {suite}"}
+    r.lpush(c.QUEUE, number)  # the queue: workers take from the right
+    r.lpush(c.LOAD, number)   # the load, read by KEDA: one entry per request waiting or running
+    follow_up = "The user will be notified in Open WebUI." if uid else "Ask for its status with render_status."
+    return {"number": number, "title": title, "position": _position(number), "visible_marking": visible,
+            "message": f"Request recorded. {follow_up}"}
 
 
 @mcp.tool()
-def etat_rendu(numero: int, ctx: Context) -> dict:
-    """Donne l'état d'une demande de l'utilisateur : en_attente (avec sa position), en_cours,
-    termine (avec l'image en Markdown et l'artefact 3D à recopier tels quels, et le lien de la scène
-    Blender, scene_blend_markdown, à recopier tel quel s'il est présent) ou erreur."""
-    m.DEMANDES.labels(outil="etat_rendu").inc()
-    utilisateur = _utilisateur(ctx)
-    d = {c.texte(k): c.texte(v) for k, v in r.hgetall(c.demande(numero)).items()}
-    if not d or d.get("utilisateur") != utilisateur:
-        return {"numero": numero, "erreur": "aucune demande de ce numéro pour cet utilisateur"}
-    etat = {"numero": numero, "titre": d["titre"], "statut": d["statut"],
-            "identifiant": d.get("identifiant", ""), "marquage_visible": d.get("marquage_visible") == "1"}
-    if d["statut"] == "en_attente":
-        etat["position"] = _position(numero)
-    elif d["statut"] == "en_cours":
-        etat["depuis_secondes"] = round(time.time() - float(d["debut"]))
-        etat["travailleur"] = d.get("travailleur", "")
-    elif d["statut"] == "termine":
-        etat["duree_secondes"] = round(float(d["fin"]) - float(d["debut"]))
-        etat["travailleur"] = d.get("travailleur", "")
-        if d.get("assets"):  # assets de la bibliothèque utilisés : nom, source, licence
-            etat["assets"] = c.trace_assets(d["assets"].split(","))
-        etat["image_markdown"] = f'![{d["titre"]}]({c.lien(numero, "png")})'
-        etat["artefact_3d"] = c.artefact(numero, d["titre"])
-        if d.get("scene"):  # module s3d06 : la scène Blender, par le lien stable du studio
-            etat["scene_blend_markdown"] = f"[{c.LIBELLE_SCENE}]({c.lien(numero, 'blend')})"
-            etat["scene_disponible_jusqu_au"] = time.strftime("%Y-%m-%d", time.gmtime(float(d["fin"]) + c.DUREE_SCENES))
-        elif d.get("scene_prevue") == "1":
-            etat["scene_blend"] = "indisponible"
+def render_status(number: int, ctx: Context) -> dict:
+    """Gives the status of one of the user's requests: queued (with its position), running,
+    done (with the image in Markdown and the 3D artifact to copy as is, and the Blender scene
+    link, scene_blend_markdown, to copy as is if present) or error."""
+    m.REQUESTS.labels(tool="render_status").inc()
+    user = _user(ctx)
+    d = {c.text(k): c.text(v) for k, v in r.hgetall(c.request(number)).items()}
+    if not d or d.get("user") != user:
+        return {"number": number, "error": "no request with this number for this user"}
+    status = {"number": number, "title": d["title"], "status": d["status"],
+              "id": d.get("id", ""), "visible_marking": d.get("visible_marking") == "1"}
+    if d["status"] == "queued":
+        status["position"] = _position(number)
+    elif d["status"] == "running":
+        status["running_seconds"] = round(time.time() - float(d["started"]))
+        status["worker"] = d.get("worker", "")
+    elif d["status"] == "done":
+        status["duration_seconds"] = round(float(d["finished"]) - float(d["started"]))
+        status["worker"] = d.get("worker", "")
+        if d.get("assets"):  # library assets used: name, source, license
+            status["assets"] = c.asset_trace(d["assets"].split(","))
+        status["image_markdown"] = f'![{d["title"]}]({c.link(number, "png")})'
+        status["model_3d"] = c.artifact(number, d["title"])
+        if d.get("scene"):  # module s3d06: the Blender scene, through the studio's stable link
+            status["scene_blend_markdown"] = f"[{c.SCENE_LABEL}]({c.link(number, 'blend')})"
+            status["scene_available_until"] = time.strftime("%Y-%m-%d", time.gmtime(float(d["finished"]) + c.SCENE_TTL))
+        elif d.get("scene_planned") == "1":
+            status["scene_blend"] = "unavailable"
     else:
-        etat["erreur"] = d.get("erreur", "")
-    return etat
+        status["error"] = d.get("error", "")
+    return status
 
 
 @mcp.tool()
-def mes_rendus(ctx: Context) -> list[dict]:
-    """Liste les demandes de l'utilisateur connecté (statut, worker, position), de la plus récente à la plus ancienne."""
-    m.DEMANDES.labels(outil="mes_rendus").inc()
-    utilisateur = _utilisateur(ctx)
-    dernier = int(r.get("studio:compteur") or 0)
-    resultats = []
-    for n in range(dernier, 0, -1):
-        d = {c.texte(k): c.texte(v) for k, v in r.hgetall(c.demande(n)).items()}
-        if d.get("utilisateur") == utilisateur:
-            ligne = {"numero": n, "titre": d["titre"], "statut": d["statut"], "marquage_visible": d.get("marquage_visible") == "1"}
-            if d["statut"] == "en_attente":
-                ligne["position"] = _position(n)
-            if d.get("travailleur"):
-                ligne["travailleur"] = d["travailleur"]
-            resultats.append(ligne)
-    return resultats
+def my_renders(ctx: Context) -> list[dict]:
+    """Lists the signed-in user's requests (status, worker, position), most recent first."""
+    m.REQUESTS.labels(tool="my_renders").inc()
+    user = _user(ctx)
+    last = int(r.get("studio:counter") or 0)
+    results = []
+    for n in range(last, 0, -1):
+        d = {c.text(k): c.text(v) for k, v in r.hgetall(c.request(n)).items()}
+        if d.get("user") == user:
+            line = {"number": n, "title": d["title"], "status": d["status"], "visible_marking": d.get("visible_marking") == "1"}
+            if d["status"] == "queued":
+                line["position"] = _position(n)
+            if d.get("worker"):
+                line["worker"] = d["worker"]
+            results.append(line)
+    return results
 
 
 @mcp.tool()
-def lister_assets(ctx: Context, recherche: str = "", genre: str = "") -> list[dict]:
-    """Cherche dans la bibliothèque d'assets du studio : objets 3D réels (genre « modele ») et
-    éclairages HDRI (genre « environnement »). À appeler avant de construire un meuble, un objet ou
-    un éclairage : s'il existe, utilisez-le. recherche : un mot (chaise, lampe, studio…), vide pour tout.
-    Dans le code de la scène : charger_asset("nom", position=(x, y, z), rotation_z=…) pour un objet
-    (posé au sol à cette position, dimensions en mètres : largeur, profondeur, hauteur ; face avant
-    tournée vers -y : rotation_z=math.pi pour la tourner vers +y), environnement("nom") pour l'éclairage.
-    Pour montrer la bibliothèque à l'utilisateur, recopiez vignette_markdown."""
-    m.DEMANDES.labels(outil="lister_assets").inc()
-    _utilisateur(ctx)  # même contrôle que les autres outils
-    mot = recherche.strip().lower()
-    resultats = []
-    for famille, fiches in (("modele", c.catalogue()["modeles"]), ("environnement", c.catalogue()["environnements"])):
-        if genre and not famille.startswith(genre.strip().lower()[:5]):
+def list_assets(ctx: Context, search: str = "", kind: str = "") -> list[dict]:
+    """Searches the studio's asset library: real 3D objects (kind "model") and
+    HDRI lighting (kind "environment"). Call it before building a piece of furniture, an object or
+    lighting: if it exists, use it. search: one word (chair, lamp, studio…), empty for everything.
+    In the scene code: load_asset("name", position=(x, y, z), rotation_z=…) for an object
+    (placed on the floor at this position, dimensions in meters: width, depth, height; front
+    facing -y: rotation_z=math.pi to face +y), environment("name") for the lighting.
+    To show the library to the user, copy thumbnail_markdown."""
+    m.REQUESTS.labels(tool="list_assets").inc()
+    _user(ctx)  # same check as the other tools
+    word = search.strip().lower()
+    results = []
+    for family, sheets in (("model", c.catalog()["models"]), ("environment", c.catalog()["environments"])):
+        if kind and not family.startswith(kind.strip().lower()[:5]):
             continue
-        for nom, f in fiches.items():
-            # Recherche dans les noms, en trois langues, et dans les étiquettes.
-            texte = " ".join([nom, *f["nom"].values(), *f.get("etiquettes", [])]).lower()
-            if mot and mot not in texte:
+        for name, f in sheets.items():
+            # Search in the names, in three languages, and in the tags.
+            text = " ".join([name, *f["name"].values(), *f.get("tags", [])]).lower()
+            if word and word not in text:
                 continue
-            libelle = f["nom"].get(c.LANGUE, f["nom"]["FR"])
-            resultats.append({
-                "nom": nom,                                  # le nom à écrire dans le code
-                "genre": famille,
-                "libelle": libelle,
-                "dimensions_m": f.get("dimensions_m"),       # pour placer sans deviner
-                "vignette_markdown": f"![{libelle}]({c.PUBLIC}/a/{nom}.jpg)",
-                "exemple": f'charger_asset("{nom}")' if famille == "modele" else f'environnement("{nom}")',
-                "source": "Poly Haven, CC0" if f["source"].get("polyhaven") else f["source"].get("licence", ""),
+            label = f["name"].get(c.LANGUAGE, f["name"]["EN"])
+            results.append({
+                "name": name,                                # the name to write in the code
+                "kind": family,
+                "label": label,
+                "dimensions_m": f.get("dimensions_m"),       # to place objects without guessing
+                "thumbnail_markdown": f"![{label}]({c.PUBLIC}/a/{name}.jpg)",
+                "example": f'load_asset("{name}")' if family == "model" else f'environment("{name}")',
+                "source": "Poly Haven, CC0" if f["source"].get("polyhaven") else f["source"].get("license", ""),
             })
-    return resultats
+    return results
 
 
-# ---------------------------------------------------------------- Fichiers (liens signés) et santé
+# ---------------------------------------------------------------- Files (signed links) and health
 
-@mcp.custom_route("/r/{numero}/{nom}", methods=["GET"])
-async def servir(request: Request) -> Response:
+@mcp.custom_route("/r/{number}/{name}", methods=["GET"])
+async def serve(request: Request) -> Response:
     try:
-        numero = int(request.path_params["numero"])
-        sig, extension = request.path_params["nom"].rsplit(".", 1)
+        number = int(request.path_params["number"])
+        sig, extension = request.path_params["name"].rsplit(".", 1)
     except ValueError:
         return Response(status_code=404)
-    if extension not in ("png", "glb", "blend") or not hmac.compare_digest(sig, c.signature(numero, extension)):
+    if extension not in ("png", "glb", "blend") or not hmac.compare_digest(sig, c.signature(number, extension)):
         return Response(status_code=404)
-    if extension == "blend":  # module s3d06 : redirection vers le stockage, lien de soixante secondes
-        return await _scene(numero)
-    contenu = r.get(c.fichier(numero, extension))
-    if contenu is None:
+    if extension == "blend":  # module s3d06: redirect to storage, sixty-second link
+        return await _scene(number)
+    content = r.get(c.file(number, extension))
+    if content is None:
         return Response(status_code=404)
-    return Response(contenu, media_type="image/png" if extension == "png" else "model/gltf-binary",
+    return Response(content, media_type="image/png" if extension == "png" else "model/gltf-binary",
                     headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "private, max-age=3600"})
 
 
-async def _scene(numero: int) -> Response:
-    d = {c.texte(k): c.texte(v) for k, v in r.hgetall(c.demande(numero)).items()}
-    if not d.get("scene") or time.time() > float(d.get("fin") or 0) + c.DUREE_SCENES:
-        m.LIENS_SCENE.labels(resultat="expiree").inc()
+async def _scene(number: int) -> Response:
+    d = {c.text(k): c.text(v) for k, v in r.hgetall(c.request(number)).items()}
+    if not d.get("scene") or time.time() > float(d.get("finished") or 0) + c.SCENE_TTL:
+        m.SCENE_LINKS.labels(result="expired").inc()
         return Response(status_code=404)
     try:
-        url = await asyncio.to_thread(stockage.lien_presigne, d)  # identifiants de lecture, puis signature
-    except Exception as e:  # stockage injoignable : le reste du studio continue
-        print(f"lien de scène {numero} : {e}")
-        m.LIENS_SCENE.labels(resultat="indisponible").inc()
+        url = await asyncio.to_thread(storage.presigned_link, d)  # read credentials, then signature
+    except Exception as e:  # storage unreachable: the rest of the studio keeps going
+        print(f"scene link {number}: {e}")
+        m.SCENE_LINKS.labels(result="unavailable").inc()
         return Response(status_code=503)
-    m.LIENS_SCENE.labels(resultat="redirige").inc()
+    m.SCENE_LINKS.labels(result="redirected").inc()
     return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"})
 
 
-@mcp.custom_route("/a/{fichier}", methods=["GET"])
-async def vignette(request: Request) -> Response:
-    """Vignettes de la bibliothèque : publiques, sans signature (assets libres de droits, aucune donnée d'utilisateur)."""
-    nom, _, extension = request.path_params["fichier"].rpartition(".")
-    cat = c.catalogue()
-    fiche = cat["modeles"].get(nom) or cat["environnements"].get(nom)  # nom cherché, jamais concaténé tel quel
-    if extension != "jpg" or fiche is None:
+@mcp.custom_route("/a/{file}", methods=["GET"])
+async def thumbnail(request: Request) -> Response:
+    """Library thumbnails: public, unsigned (royalty-free assets, no user data)."""
+    name, _, extension = request.path_params["file"].rpartition(".")
+    cat = c.catalog()
+    sheet = cat["models"].get(name) or cat["environments"].get(name)  # name looked up, never concatenated as is
+    if extension != "jpg" or sheet is None:
         return Response(status_code=404)
-    return FileResponse(c.ASSETS / fiche["vignette"], media_type="image/jpeg",
+    return FileResponse(c.ASSETS / sheet["thumbnail"], media_type="image/jpeg",
                         headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
 
 
 @mcp.custom_route("/metrics", methods=["GET"])
-async def metriques(request: Request) -> Response:
-    """Mesures au format Prometheus : interne au cluster (aucun Ingress ne publie /metrics)."""
-    return Response(m.generate_latest(m.REGISTRE), media_type=m.CONTENT_TYPE_LATEST)
+async def metrics(request: Request) -> Response:
+    """Metrics in the Prometheus format: internal to the cluster (no Ingress publishes /metrics)."""
+    return Response(m.generate_latest(m.REGISTRY), media_type=m.CONTENT_TYPE_LATEST)
 
 
-@mcp.custom_route("/sante", methods=["GET"])
-async def sante(request: Request) -> Response:
-    return JSONResponse({"ok": bool(r.ping()), "en_attente": r.llen(c.FILE), "en_traitement": r.llen(c.TRAITEMENT), "charge": r.llen(c.CHARGE)})
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> Response:
+    return JSONResponse({"ok": bool(r.ping()), "queued": r.llen(c.QUEUE), "processing": r.llen(c.PROCESSING), "load": r.llen(c.LOAD)})
 
 
-# Routes de la série Intégrations (widget de suivi, fonction Pipe) : fichier à part, absent du dépôt du module s3d02.
+# Routes of the next series (tracking widget, Pipe function): a separate file, not in this repository.
 try:
     import integrations
-    integrations.brancher(mcp, r, _position)
+    integrations.connect(mcp, r, _position)
 except ImportError:
     pass
 
 
-# ---------------------------------------------------------------- Demandes orphelines
+# ---------------------------------------------------------------- Orphan requests
 
-async def _surveiller() -> None:
-    """Remet dans la file les demandes dont le worker ne bat plus (pod supprimé, arrêt brutal)."""
-    suspects: set[int] = set()  # demandes sans battement à la ronde précédente
+async def _watch() -> None:
+    """Puts back in the queue the requests whose worker no longer beats (pod deleted, hard stop)."""
+    suspects: set[int] = set()  # requests without a heartbeat in the previous round
     while True:
         await asyncio.sleep(3)
         try:
-            for brut in r.lrange(c.TRAITEMENT, 0, -1):
-                n = int(brut)
-                if r.exists(c.vivant(n)):  # le worker bat : tout va bien
+            for raw in r.lrange(c.PROCESSING, 0, -1):
+                n = int(raw)
+                if r.exists(c.alive(n)):  # the worker beats: all good
                     suspects.discard(n)
                     continue
-                if n not in suspects:      # première ronde sans battement : on attend la suivante
+                if n not in suspects:      # first round without a heartbeat: wait for the next one
                     suspects.add(n)
                     continue
                 suspects.discard(n)
-                if r.lrem(c.TRAITEMENT, 1, brut):  # une seule copie du serveur gagne
-                    r.hset(c.demande(n), mapping={"statut": "en_attente", "travailleur": ""})
-                    r.rpush(c.FILE, n)  # à droite : elle repasse en premier
-        except Exception as e:  # Redis indisponible un instant : on réessaie
-            print(f"surveillance : {e}")
+                if r.lrem(c.PROCESSING, 1, raw):  # only one server copy wins
+                    r.hset(c.request(n), mapping={"status": "queued", "worker": ""})
+                    r.rpush(c.QUEUE, n)  # on the right: it goes first again
+        except Exception as e:  # Redis briefly unavailable: try again
+            print(f"watch: {e}")
 
 
-# ---------------------------------------------------------------- Identifiants de dépôt (module s3d06)
+# ---------------------------------------------------------------- Upload credentials (module s3d06)
 
-async def _preparer_depots() -> None:
-    """Dès qu'un worker prend une demande, des identifiants de dépôt pour elle seule (quinze minutes).
-    Le worker ne voit jamais la clé longue durée : elle reste dans le serveur MCP."""
+async def _prepare_uploads() -> None:
+    """As soon as a worker takes a request, upload credentials for it alone (fifteen minutes).
+    The worker never sees the long-term key: it stays in the MCP server."""
     while True:
         await asyncio.sleep(2)
         try:
-            en_cours = r.lrange(c.TRAITEMENT, 0, -1)
-        except Exception:  # Redis indisponible un instant : on réessaie
+            running = r.lrange(c.PROCESSING, 0, -1)
+        except Exception:  # Redis briefly unavailable: try again
             continue
-        for brut in en_cours:
-            n = int(brut)
+        for raw in running:
+            n = int(raw)
             try:
-                # Une seule copie du serveur s'en charge (SET NX), une seule fois par demande.
-                if r.hget(c.demande(n), "scene_prevue") != b"1" or not r.set(f"studio:depot-prepare:{n}", 1, nx=True, ex=c.DUREE_IDENTIFIANTS):
+                # A single server copy handles it (SET NX), once per request.
+                if r.hget(c.request(n), "scene_planned") != b"1" or not r.set(f"studio:upload-prepared:{n}", 1, nx=True, ex=c.CREDENTIALS_TTL):
                     continue
-                d = {c.texte(k): c.texte(v) for k, v in r.hgetall(c.demande(n)).items()}
-                ident = await asyncio.to_thread(stockage.preparer_depot, d)
-                r.setex(c.depot_s3(n), c.DUREE_IDENTIFIANTS, json.dumps(ident))
-            except Exception as e:  # stockage injoignable : on réessaiera à la ronde suivante
-                r.delete(f"studio:depot-prepare:{n}")
-                print(f"identifiants de dépôt {n} : {e}")
+                d = {c.text(k): c.text(v) for k, v in r.hgetall(c.request(n)).items()}
+                creds = await asyncio.to_thread(storage.prepare_upload, d)
+                r.setex(c.upload_s3(n), c.CREDENTIALS_TTL, json.dumps(creds))
+            except Exception as e:  # storage unreachable: try again in the next round
+                r.delete(f"studio:upload-prepared:{n}")
+                print(f"upload credentials {n}: {e}")
 
 
 if __name__ == "__main__":
     app = mcp.streamable_http_app()
-    demarrage = app.router.lifespan_context
+    startup = app.router.lifespan_context
 
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def cycle(application):
-        taches = [asyncio.create_task(_surveiller())]
-        if c.STOCKAGE:
-            taches.append(asyncio.create_task(_preparer_depots()))
-        async with demarrage(application):
+    async def lifespan(application):
+        tasks = [asyncio.create_task(_watch())]
+        if c.STORAGE:
+            tasks.append(asyncio.create_task(_prepare_uploads()))
+        async with startup(application):
             yield
-        for tache in taches:
-            tache.cancel()
+        for task in tasks:
+            task.cancel()
 
-    app.router.lifespan_context = cycle
+    app.router.lifespan_context = lifespan
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

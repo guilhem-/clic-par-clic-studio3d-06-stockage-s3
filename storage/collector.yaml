@@ -1,5 +1,5 @@
-# Collecteur OpenTelemetry du stockage (module s3d06) : mesures de RustFS reçues en OTLP,
-# republiées au format Prometheus sur le port 8889 (tâche « stockage » de services/observabilite).
+# OpenTelemetry collector of the storage (module s3d06): RustFS metrics received in OTLP,
+# published again in Prometheus format on port 8889 ("storage" job of observability/).
 receivers:
   otlp:
     protocols:

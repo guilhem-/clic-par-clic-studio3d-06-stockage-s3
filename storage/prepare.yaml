@@ -1,0 +1,38 @@
+# Storage preparation Job (module s3d06): bucket, lifecycle, policies, accounts.
+# MODE: --prepare (default), --empty or --test (replaced by deploy.sh).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prepare
+  namespace: storage
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: prepare }       # allowed by the s3-ingress rule
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: config
+          configMap:
+            name: storage-config
+            items:
+              - { key: upload.json, path: policies/upload.json }
+              - { key: links.json, path: policies/links.json }
+              - { key: viewer.json, path: policies/viewer.json }
+              - { key: lifecycle.json, path: lifecycle.json }
+      containers:
+        - name: prepare
+          image: storage-prepare:1
+          imagePullPolicy: IfNotPresent
+          args: ["python", "prepare.py", "MODE"]
+          env:
+            - { name: S3_INTERNAL, value: "http://s3.storage.svc.cluster.local:9000" }
+            - { name: ROOT_KEY, valueFrom: { secretKeyRef: { name: s3-root, key: key } } }
+            - { name: ROOT_SECRET, valueFrom: { secretKeyRef: { name: s3-root, key: secret } } }
+            - { name: UPLOAD_SECRET, valueFrom: { secretKeyRef: { name: accounts, key: upload-secret } } }
+            - { name: LINKS_SECRET, valueFrom: { secretKeyRef: { name: accounts, key: links-secret } } }
+            - { name: VIEWER_SECRET, valueFrom: { secretKeyRef: { name: accounts, key: viewer-secret } } }
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }

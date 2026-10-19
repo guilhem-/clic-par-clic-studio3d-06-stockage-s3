@@ -1,17 +1,17 @@
-# Stockage objet de l'organisation (équipe stockage, module s3d06) : un service compatible S3, dans
-# son propre espace de noms. Produit retenu : RustFS 1.0.1 (Apache 2.0), image épinglée par empreinte.
-# Le service s'appelle « s3 », pas « rustfs » : le nom du rôle survit au changement de produit.
-#   kubectl apply -f k8s.yaml   (après les secrets s3-racine et comptes : voir deployer.mjs)
+# The organization's object storage (storage team, module s3d06): an S3-compatible service, in its
+# own namespace. Product chosen: RustFS 1.0.1 (Apache 2.0), image pinned by digest.
+# The service is called "s3", not "rustfs": the role's name outlives a product change.
+#   kubectl apply -f k8s.yaml   (after the s3-root and accounts secrets: see deploy.sh)
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: stockage
+  name: storage
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: s3-donnees
-  namespace: stockage
+  name: s3-data
+  namespace: storage
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: local-path
@@ -22,23 +22,23 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: s3
-  namespace: stockage
+  namespace: storage
 spec:
   replicas: 1
-  strategy: { type: Recreate }        # un seul pod écrit sur le volume
+  strategy: { type: Recreate }        # a single pod writes to the volume
   selector:
     matchLabels: { app: s3 }
   template:
     metadata:
       labels: { app: s3 }
     spec:
-      securityContext: { fsGroup: 10001 }  # utilisateur « rustfs » de l'image
+      securityContext: { fsGroup: 10001 }  # "rustfs" user of the image
       volumes:
-        - name: donnees
-          persistentVolumeClaim: { claimName: s3-donnees }
+        - name: data
+          persistentVolumeClaim: { claimName: s3-data }
       containers:
         - name: rustfs
-          # rustfs/rustfs:1.0.1, épinglée par son empreinte (index multi-architecture)
+          # rustfs/rustfs:1.0.1, pinned by its digest (multi-architecture index)
           image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
           imagePullPolicy: IfNotPresent
           ports:
@@ -50,17 +50,17 @@ spec:
             - { name: RUSTFS_CONSOLE_ENABLE, value: "true" }
             - { name: RUSTFS_CONSOLE_ADDRESS, value: ":9001" }
             - { name: RUSTFS_REGION, value: us-east-1 }
-            - name: RUSTFS_ACCESS_KEY       # la clé racine : elle reste dans cet espace de noms
-              valueFrom: { secretKeyRef: { name: s3-racine, key: cle } }
+            - name: RUSTFS_ACCESS_KEY       # the root key: it stays in this namespace
+              valueFrom: { secretKeyRef: { name: s3-root, key: key } }
             - name: RUSTFS_SECRET_KEY
-              valueFrom: { secretKeyRef: { name: s3-racine, key: secret } }
-            # Mesures : poussées en OTLP vers le collecteur, qui les publie pour Prometheus.
-            - { name: RUSTFS_OBS_ENDPOINT, value: "http://otel-collecteur.stockage.svc.cluster.local:4318" }
+              valueFrom: { secretKeyRef: { name: s3-root, key: secret } }
+            # Metrics: pushed in OTLP to the collector, which publishes them for Prometheus.
+            - { name: RUSTFS_OBS_ENDPOINT, value: "http://otel-collector.storage.svc.cluster.local:4318" }
             - { name: RUSTFS_OBS_METER_INTERVAL, value: "15" }
             - { name: RUSTFS_OBS_TRACES_EXPORT_ENABLED, value: "false" }
             - { name: RUSTFS_OBS_LOGS_EXPORT_ENABLED, value: "false" }
           volumeMounts:
-            - { name: donnees, mountPath: /data }
+            - { name: data, mountPath: /data }
           readinessProbe:
             httpGet: { path: /health, port: 9000 }
             periodSeconds: 5
@@ -71,20 +71,20 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: s3                            # le nom du rôle, pas du produit
-  namespace: stockage
+  name: s3                            # the role's name, not the product's
+  namespace: storage
 spec:
   selector: { app: s3 }
   ports:
     - { name: s3, port: 9000, targetPort: 9000 }
     - { name: console, port: 9001, targetPort: 9001 }
 ---
-# Entrées : l'espace du studio (port S3), Traefik (publication), la préparation. Personne d'autre.
+# Ingress: the studio's namespace (S3 port), Traefik (publication), the prepare Job. Nobody else.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: s3-entrees
-  namespace: stockage
+  name: s3-ingress
+  namespace: storage
 spec:
   podSelector: { matchLabels: { app: s3 } }
   policyTypes: [Ingress]
@@ -95,15 +95,15 @@ spec:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
           podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
       ports: [{ port: 9000, protocol: TCP }, { port: 9001, protocol: TCP }]
-    - from: [{ podSelector: { matchLabels: { app: preparation } } }]
+    - from: [{ podSelector: { matchLabels: { app: prepare } } }]
       ports: [{ port: 9000, protocol: TCP }]
 ---
-# Publication : télécharger avec un lien signé, rien d'autre (ni écriture, ni administration).
+# Publication: download with a signed link, nothing else (no write, no administration).
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: s3-public
-  namespace: stockage
+  namespace: storage
 spec:
   entryPoints: [web]
   routes:
@@ -111,12 +111,12 @@ spec:
       kind: Rule
       services: [{ name: s3, port: 9000 }]
 ---
-# Console de RustFS : publiée pour le tournage (en production, elle resterait interne).
+# RustFS console: published for the demo (in production, it would stay internal).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: console
-  namespace: stockage
+  namespace: storage
 spec:
   ingressClassName: traefik
   rules:
@@ -127,30 +127,30 @@ spec:
             pathType: Prefix
             backend: { service: { name: s3, port: { number: 9001 } } }
 ---
-# Collecteur OpenTelemetry : reçoit les mesures de RustFS (OTLP) et les publie au format Prometheus
-# (port 8889), lu par le Prometheus de services/observabilite. RustFS n'a pas de page /metrics.
+# OpenTelemetry collector: receives the RustFS metrics (OTLP) and publishes them in Prometheus format
+# (port 8889), read by the Prometheus of observability/. RustFS has no /metrics page.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: otel-collecteur
-  namespace: stockage
+  name: otel-collector
+  namespace: storage
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: otel-collecteur }
+    matchLabels: { app: otel-collector }
   template:
     metadata:
-      labels: { app: otel-collecteur }
+      labels: { app: otel-collector }
     spec:
       volumes:
         - name: configuration
-          configMap: { name: otel-collecteur }
+          configMap: { name: otel-collector }
       containers:
-        - name: collecteur
-          # otel/opentelemetry-collector:0.162.0 (distribution de base), épinglée par empreinte
+        - name: collector
+          # otel/opentelemetry-collector:0.162.0 (core distribution), pinned by digest
           image: otel/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2
           imagePullPolicy: IfNotPresent
-          args: ["--config=/etc/otelcol/collecteur.yaml"]
+          args: ["--config=/etc/otelcol/collector.yaml"]
           ports:
             - { name: otlp-http, containerPort: 4318 }
             - { name: prometheus, containerPort: 8889 }
@@ -163,10 +163,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: otel-collecteur
-  namespace: stockage
+  name: otel-collector
+  namespace: storage
 spec:
-  selector: { app: otel-collecteur }
+  selector: { app: otel-collector }
   ports:
     - { name: otlp-http, port: 4318, targetPort: 4318 }
     - { name: prometheus, port: 8889, targetPort: 8889 }

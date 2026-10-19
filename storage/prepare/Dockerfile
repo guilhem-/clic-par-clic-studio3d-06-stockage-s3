@@ -1,7 +1,7 @@
-# Préparation du stockage S3 (équipe stockage, module s3d06) : bucket, cycle de vie, politiques, comptes.
-#   docker build -t stockage-preparation:1 services/stockage/preparation
-# Python + boto3 (bucket, cycle de vie, essais) et le client rc de RustFS (comptes et politiques),
-# téléchargé depuis sa publication GitHub, empreinte vérifiée.
+# S3 storage preparation (storage team, module s3d06): bucket, lifecycle, policies, accounts.
+#   docker build -t storage-prepare:1 storage/prepare
+# Python + boto3 (bucket, lifecycle, tests) and the RustFS rc client (accounts and policies),
+# downloaded from its GitHub release, checksum verified.
 FROM python:3.12-slim
 
 ARG RC_VERSION=0.1.36
@@ -15,8 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
   && rm -rf /tmp/* && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir "boto3==1.43.111"
-RUN useradd --create-home stockage
-USER stockage
+RUN useradd --create-home storage
+USER storage
 WORKDIR /app
-COPY preparer.py ./
-CMD ["python", "preparer.py"]
+COPY prepare.py ./
+CMD ["python", "prepare.py"]

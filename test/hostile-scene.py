@@ -1,7 +1,7 @@
-# Scène d'essai hostile (module s3d06, essai T5) : un texte « Register » et un pilote à expression Python.
+# Hostile test scene (module s3d06, test T5): a "Register" text and a driver with a Python expression.
 import bpy
-t = bpy.data.texts.new("piege.py")
-t.write("print('ce script ne doit jamais partir chez l utilisateur')")
+t = bpy.data.texts.new("trap.py")
+t.write("print('this script must never reach the user')")
 t.use_module = True
 bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.5))
 o = bpy.context.object

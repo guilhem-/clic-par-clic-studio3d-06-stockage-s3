@@ -1,20 +1,20 @@
 {
   "Rules": [
     {
-      "ID": "scenes-7-jours",
+      "ID": "scenes-7-days",
       "Status": "Enabled",
       "Filter": { "Prefix": "scenes/" },
       "Expiration": { "Days": 7 },
       "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
     },
     {
-      "ID": "marqueurs-orphelins",
+      "ID": "orphan-markers",
       "Status": "Enabled",
       "Filter": { "Prefix": "scenes/" },
       "Expiration": { "ExpiredObjectDeleteMarker": true }
     },
     {
-      "ID": "envois-abandonnes",
+      "ID": "abandoned-uploads",
       "Status": "Enabled",
       "Filter": { "Prefix": "" },
       "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
